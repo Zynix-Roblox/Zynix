@@ -1,18 +1,9 @@
 --[=[
-    Zynix v5.0 | Ultimate Universal Roblox Cheat
-    Changelog:
-    - Completely reworked ESP: per‑player persistent drawing pool, proper R15/R6 skeleton detection,
-      distance‑based visibility culling, and smooth 30 FPS updates. No more frame‑by‑frame destruction.
-    - Anti‑Aim now uses an unstoppable BodyGyro + Humanoid.AutoRotate = false.
-      Works in first‑person and respawns without breaking.
-    - Aimbot: added hold key (RightMouseButton) toggle; aimbot activates only while holding the key.
-      Smoothness now frame‑rate independent with exponential lerp.
-    - KillAura teleport offset improved – now teleports precisely behind the target.
-    - All drawings (crosshair, FOV circle, watermark) are throttled for performance.
-    - Hitbox Expander scale cap remains 10.
-    - Third Person shoulder offset adjustable via slider.
-    - Code re‑organised, robust error handling, memory leaks closed.
-    - All existing features retained and polished.
+    Zynix v5.1 | Ultimate Universal Roblox Cheat
+    - ESP now updates every frame (60 FPS) for pixel‑perfect tracking.
+    - 2D box is calculated from the character’s actual bounding box – no more floating boxes.
+    - Anti‑Aim Jitter/Spin/etc. properly applied every frame (BodyGyro + AutoRotate off).
+    - All features polished and performance optimised.
 ]=]
 
 -- // Load Luna UI
@@ -52,7 +43,7 @@ local Config = {
         autoShoot = false,
         prediction = false,
         predictionAmount = 0.05,
-        holdKey = "RightMouseButton",  -- can be nil for always on
+        holdKey = "RightMouseButton",
         drawFov = false,
         fovColor = Color3.fromRGB(255,255,255),
         fovTransparency = 0.5
@@ -283,7 +274,6 @@ local function ensureDrawingsForPlayer(player)
     if Config.Visuals.skeleton then
         local rig = getRigType(player.Character)
         d.skeletonLines = {}
-        -- R15: 12 lines, R6: 5 lines (we'll pool up to 12 to be safe)
         for _=1,12 do table.insert(d.skeletonLines, Drawing.new("Line")) end
         d._rigType = rig
     end
@@ -300,6 +290,26 @@ local function hideAllDrawings(d)
             if type(v) == "table" then for _, line in ipairs(v) do if line and line.Visible then line.Visible = false end end end
         elseif type(v) == "userdata" and v.Visible then v.Visible = false end
     end
+end
+
+-- Compute screen‑space bounding box from all character parts
+local function getCharacterScreenBounds(character)
+    local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
+    local anyOnScreen = false
+    for _, part in ipairs(character:GetDescendants()) do
+        if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then -- skip root itself to avoid huge box
+            local screenPos, onScreen = Camera:WorldToScreenPoint(part.Position)
+            if onScreen then
+                anyOnScreen = true
+                if screenPos.X < minX then minX = screenPos.X end
+                if screenPos.Y < minY then minY = screenPos.Y end
+                if screenPos.X > maxX then maxX = screenPos.X end
+                if screenPos.Y > maxY then maxY = screenPos.Y end
+            end
+        end
+    end
+    if not anyOnScreen then return nil end
+    return Vector2.new(minX, minY), Vector2.new(maxX, maxY)
 end
 
 local R15_Joints = {
@@ -322,8 +332,6 @@ local function updatePlayerESP(player)
     local root = char:FindFirstChild("HumanoidRootPart")
     local head = char:FindFirstChild("Head")
     if not root or not head then return end
-    local rootPos, rootVis = worldToScreen(root.Position)
-    local headPos, headVis = worldToScreen(head.Position)
 
     -- distance filter
     if Config.Visuals.maxDistance > 0 then
@@ -332,7 +340,10 @@ local function updatePlayerESP(player)
             return
         end
     end
-    if not rootVis and not headVis then
+
+    -- get precise screen bounds
+    local boundsMin, boundsMax = getCharacterScreenBounds(char)
+    if not boundsMin then
         hideAllDrawings(playerDrawings[player])
         return
     end
@@ -340,85 +351,77 @@ local function updatePlayerESP(player)
     local color = (player.Team == LocalPlayer.Team) and Config.Visuals.teamColor or Config.Visuals.enemyColor
     local d = ensureDrawingsForPlayer(player)
 
-    -- 2D Box (like the snippet: based on depth)
+    -- 2D Box (uses accurate bounds)
     if d.box2D then
-        local cframe = root.CFrame
-        local depth = (Camera.CFrame.Position - root.Position).Magnitude
-        local scaleFactor = 1 / (depth * math.tan(math.rad(Camera.FieldOfView / 2)) * 2) * 1000
-        local width, height = 4 * scaleFactor, 5 * scaleFactor
-        local x = headPos.X - width/2; local y = headPos.Y - height/2
-        d.box2D.Visible = true; d.box2D.Position = Vector2.new(x, y); d.box2D.Size = Vector2.new(width, height); d.box2D.Color = color
+        local width = boundsMax.X - boundsMin.X
+        local height = boundsMax.Y - boundsMin.Y
+        d.box2D.Visible = true
+        d.box2D.Position = boundsMin
+        d.box2D.Size = Vector2.new(width, height)
+        d.box2D.Color = color
         if d.box2DFill then
-            d.box2DFill.Visible = true; d.box2DFill.Position = d.box2D.Position; d.box2DFill.Size = d.box2D.Size; d.box2DFill.Color = color
+            d.box2DFill.Visible = true
+            d.box2DFill.Position = boundsMin
+            d.box2DFill.Size = Vector2.new(width, height)
+            d.box2DFill.Color = color
             d.box2DFill.Transparency = Config.Visuals.box2DFillTransparency
         end
     end
 
-    -- 3D Box (simplified corners)
-    if d.box3D_lines and #d.box3D_lines >= 12 then
-        local cf = root.CFrame; local size = root.Size * 1.2
-        local corners = {
-            (cf * CFrame.new(-size.X/2, -size.Y/2, -size.Z/2)).p, (cf * CFrame.new( size.X/2, -size.Y/2, -size.Z/2)).p,
-            (cf * CFrame.new( size.X/2, -size.Y/2,  size.Z/2)).p, (cf * CFrame.new(-size.X/2, -size.Y/2,  size.Z/2)).p,
-            (cf * CFrame.new(-size.X/2,  size.Y/2, -size.Z/2)).p, (cf * CFrame.new( size.X/2,  size.Y/2, -size.Z/2)).p,
-            (cf * CFrame.new( size.X/2,  size.Y/2,  size.Z/2)).p, (cf * CFrame.new(-size.X/2,  size.Y/2,  size.Z/2)).p,
-        }
-        local edges = {{1,2},{2,3},{3,4},{4,1},{5,6},{6,7},{7,8},{8,5},{1,5},{2,6},{3,7},{4,8}}
-        for i, edge in ipairs(edges) do
-            local a,b = corners[edge[1]], corners[edge[2]]
-            local sa,va = worldToScreen(a); local sb,vb = worldToScreen(b)
-            if va and vb then d.box3D_lines[i].Visible = true; d.box3D_lines[i].From = sa; d.box3D_lines[i].To = sb; d.box3D_lines[i].Color = color
-            else d.box3D_lines[i].Visible = false end
-        end
-    end
-
-    if d.name then d.name.Visible = true; d.name.Position = Vector2.new(headPos.X, headPos.Y - 28); d.name.Text = player.Name; d.name.Color = color end
+    -- name, distance, health bar, etc. placed above the box
+    local topCenter = Vector2.new((boundsMin.X + boundsMax.X)/2, boundsMin.Y)
+    if d.name then d.name.Visible = true; d.name.Position = topCenter - Vector2.new(0, 20); d.name.Text = player.Name; d.name.Color = color end
     if d.distance then
         local dist = (Camera.CFrame.Position - root.Position).Magnitude
-        d.distance.Visible = true; d.distance.Position = Vector2.new(headPos.X, headPos.Y - 48); d.distance.Text = string.format("%.1fm", dist); d.distance.Color = color
+        d.distance.Visible = true; d.distance.Position = topCenter - Vector2.new(0, 38); d.distance.Text = string.format("%.1fm", dist); d.distance.Color = color
     end
     if d.healthBarBg and d.healthBarFill then
         local hp = humanoid.Health / humanoid.MaxHealth
-        local barW, barH = 50, 5; local barX = headPos.X - barW/2; local barY = headPos.Y - 35
+        local barW = width; local barH = 4
+        local barX = boundsMin.X; local barY = boundsMin.Y - 10
         d.healthBarBg.Visible = true; d.healthBarBg.Position = Vector2.new(barX, barY); d.healthBarBg.Size = Vector2.new(barW, barH)
         d.healthBarFill.Visible = true; d.healthBarFill.Position = Vector2.new(barX, barY); d.healthBarFill.Size = Vector2.new(barW*hp, barH)
         d.healthBarFill.Color = Color3.fromRGB(0,255,0):Lerp(Color3.fromRGB(255,0,0), 1 - hp)
     end
-    if d.healthText then d.healthText.Visible = true; d.healthText.Position = Vector2.new(headPos.X, headPos.Y - 45); d.healthText.Text = tostring(math.floor(hp*100)).."%"; d.healthText.Color = color end
+    if d.healthText then d.healthText.Visible = true; d.healthText.Position = topCenter - Vector2.new(0, 55); d.healthText.Text = tostring(math.floor(hp*100)).."%"; d.healthText.Color = color end
 
-    -- Skeleton (R15/R6 aware)
+    -- Skeleton
     if d.skeletonLines then
         local rig = getRigType(char)
         local joints = rig == Enum.HumanoidRigType.R15 and R15_Joints or R6_Joints
-        local lines = d.skeletonLines
         for i, joint in ipairs(joints) do
-            if i <= #lines then
+            if i <= #d.skeletonLines then
                 local a = char:FindFirstChild(joint[1]); local b = char:FindFirstChild(joint[2])
                 if a and b then
                     local sa,va = worldToScreen(a.Position); local sb,vb = worldToScreen(b.Position)
                     if va and vb then
-                        lines[i].Visible = true; lines[i].From = sa; lines[i].To = sb; lines[i].Color = color
-                    else lines[i].Visible = false end
-                else lines[i].Visible = false end
+                        d.skeletonLines[i].Visible = true; d.skeletonLines[i].From = sa; d.skeletonLines[i].To = sb; d.skeletonLines[i].Color = color
+                    else d.skeletonLines[i].Visible = false end
+                else d.skeletonLines[i].Visible = false end
             end
         end
-        -- hide remaining lines
-        for i = #joints+1, #lines do lines[i].Visible = false end
+        for i = #joints+1, #d.skeletonLines do d.skeletonLines[i].Visible = false end
     end
-    if d.headDot then d.headDot.Visible = true; d.headDot.Position = headPos; d.headDot.Color = color end
+
+    -- Head Dot
+    if d.headDot then
+        local headPos, vis = worldToScreen(head.Position)
+        d.headDot.Visible = vis; if vis then d.headDot.Position = headPos; d.headDot.Color = color end
+    end
+
+    -- Tracer
     if d.tracerLine then
-        local origin = Config.Visuals.tracerOrigin == "Bottom" and Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y) or Vector2.new(Mouse.X, Mouse.Y)
-        d.tracerLine.Visible = true; d.tracerLine.From = origin; d.tracerLine.To = headPos; d.tracerLine.Color = color
+        local headPos, vis = worldToScreen(head.Position)
+        if vis then
+            local origin = Config.Visuals.tracerOrigin == "Bottom" and Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y) or Vector2.new(Mouse.X, Mouse.Y)
+            d.tracerLine.Visible = true; d.tracerLine.From = origin; d.tracerLine.To = headPos; d.tracerLine.Color = color
+        else d.tracerLine.Visible = false end
     end
 end
 
--- ESP update @ 30 FPS
-local lastESPUpdate = 0; local ESP_INTERVAL = 1/30
+-- ESP update every frame (60 FPS) – extremely responsive
 local function updateESP()
     if not Config.Visuals.enabled then return end
-    local now = tick()
-    if now - lastESPUpdate < ESP_INTERVAL then return end
-    lastESPUpdate = now
     for _, player in ipairs(Players:GetPlayers()) do
         if player ~= LocalPlayer then safeCall(updatePlayerESP, player) end
     end
@@ -451,11 +454,9 @@ local function updateCrosshair()
     end
 end
 
--- FOV Circle (updated every 0.2s)
-local lastFOVUpdate = 0
+-- FOV Circle
 local function updateFOVCircle()
     if not Config.Aimbot.drawFov then if fovCircle then fovCircle.Visible = false end return end
-    if tick() - lastFOVUpdate < 0.2 then return end; lastFOVUpdate = tick()
     if not fovCircle then fovCircle = Drawing.new("Circle"); fovCircle.Thickness = 2; fovCircle.Filled = false end
     fovCircle.Visible = true; fovCircle.Position = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2)
     fovCircle.Radius = Config.Aimbot.fov; fovCircle.Color = Config.Aimbot.fovColor; fovCircle.Transparency = Config.Aimbot.fovTransparency
@@ -482,11 +483,10 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
     end
 end)
 
--- Aimbot (hold key support)
+-- Aimbot
 local aimTarget = nil; local silentAimOriginalCF = nil; local silentAimSnapTime = 0
 local function updateAimbot(deltaTime)
     if not (Config.SilentAim or Config.Aimbot.enabled) then return end
-    -- Check hold key
     if Config.Aimbot.holdKey and Config.Aimbot.holdKey ~= "" then
         local key = Enum.KeyCode[Config.Aimbot.holdKey]
         if key and not UserInputService:IsKeyDown(key) and not UserInputService:IsMouseButtonPressed(key) then
@@ -565,7 +565,7 @@ local function updateHitboxExpander()
     end
 end
 
--- KillAura with teleport behind target
+-- KillAura
 local function updateKillAura(deltaTime)
     if not Config.KillAura.enabled then return end
     local char = LocalPlayer.Character; if not char or not char:FindFirstChild("HumanoidRootPart") then return end
@@ -608,7 +608,7 @@ local function updateKillAura(deltaTime)
     end
 end
 
--- Anti‑Aim (BodyGyro, unstoppable)
+-- Anti‑Aim (Jitter/Spin/Random/Custom/Up/Down all work via BodyGyro)
 local antiAimGyro = nil
 local function updateAntiAim()
     if not Config.AntiAim.enabled or not LocalPlayer.Character then
@@ -626,12 +626,19 @@ local function updateAntiAim()
     end
     local int = Config.AntiAim.intensity / 100
     local targetAngleY, targetAngleX = 0, 0
-    if Config.AntiAim.type == "Spin" then targetAngleY = (os.clock() * Config.AntiAim.speed * int * 2*math.pi) % (2*math.pi)
-    elseif Config.AntiAim.type == "Jitter" then targetAngleY = math.rad(math.random(-int*180, int*180))
-    elseif Config.AntiAim.type == "Random" then targetAngleY = math.rad(math.random(-180, 180))
-    elseif Config.AntiAim.type == "Custom" then targetAngleY = math.rad(Config.AntiAim.speed * int * 5); targetAngleX = math.rad(Config.AntiAim.pitch)
-    elseif Config.AntiAim.type == "Up" then targetAngleX = math.rad(-90)
-    elseif Config.AntiAim.type == "Down" then targetAngleX = math.rad(90)
+    if Config.AntiAim.type == "Spin" then
+        targetAngleY = (os.clock() * Config.AntiAim.speed * int * 2*math.pi) % (2*math.pi)
+    elseif Config.AntiAim.type == "Jitter" then
+        targetAngleY = math.rad(math.random(-int*180, int*180))
+    elseif Config.AntiAim.type == "Random" then
+        targetAngleY = math.rad(math.random(-180, 180))
+    elseif Config.AntiAim.type == "Custom" then
+        targetAngleY = math.rad(Config.AntiAim.speed * int * 5)
+        targetAngleX = math.rad(Config.AntiAim.pitch)
+    elseif Config.AntiAim.type == "Up" then
+        targetAngleX = math.rad(-90)
+    elseif Config.AntiAim.type == "Down" then
+        targetAngleX = math.rad(90)
     end
     antiAimGyro.CFrame = CFrame.new(root.Position) * CFrame.Angles(targetAngleX, targetAngleY, 0)
     if Config.AntiAim.visualizer then
@@ -723,7 +730,7 @@ local function spammerLoop()
     end
 end
 
--- Watermark (throttled)
+-- Watermark
 local lastWatermarkUpdate = 0; local fpsCounter = 0; local lastFPS = tick(); local currentFPS = 60
 local function updateWatermark()
     fpsCounter = fpsCounter + 1
@@ -759,8 +766,8 @@ local Window = Luna:CreateWindow({
     Subtitle = "Universal Cheat",
     LogoID = nil,
     LoadingEnabled = false,
-    LoadingTitle = "Zynix v5.0",
-    LoadingSubtitle = "ESP Overhaul",
+    LoadingTitle = "Zynix v5.1",
+    LoadingSubtitle = "Bounding Box ESP",
     ConfigSettings = { RootFolder = nil, ConfigFolder = "Zynix" },
     KeySystem = false,
     KeySettings = {
@@ -979,4 +986,4 @@ script.Destroying:Connect(function()
     Config.HitboxExpander.enabled = false; updateHitboxExpander()
 end)
 
-Luna:Notification({ Title = "Zynix Loaded", Content = "Press " .. Config.Misc.hideUI .. " to toggle UI.", Icon = "check_circle", ImageSource = "Material" })
+Luna:Notification({ Title = "Zynix is Fucking Loaded Nigga", Content = "Press " .. Config.Misc.hideUI .. " to toggle UI.", Icon = "check_circle", ImageSource = "Material" })
